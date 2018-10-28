@@ -21,24 +21,34 @@ module Embulk
       end
 
       def self.transaction(config, &control)
-        sql = config[:sql]
         params = {}
+        erb_params = config[:erb_params] || {}
+        erb_params.each do |k, v|
+          params[k] = eval(v)
+        end
+
+        sql = config[:sql]
         unless sql
           sql_erb = config[:sql_erb]
           erb = ERB.new(sql_erb)
-          erb_params = config[:erb_params] || {}
-          erb_params.each do |k, v|
-            params[k] = eval(v)
-          end
-
           sql = erb.result(binding)
         end
+
+        result_table = config[:result_table]
+        unless result_table
+          result_table_erb = config[:result_table_erb]
+          erb = ERB.new(result_table_erb)
+          result_table = erb.result(binding)
+        end
+
 
         task = {
           project: config[:project],
           keyfile: config.param(:keyfile, LocalFile, nil),
           sql: sql,
           params: params,
+          large_results: config[:large_results],
+          result_table: result_table,
           option: {
             max: config[:max],
             cache: config[:cache],
@@ -77,15 +87,32 @@ module Embulk
         rows = if @task[:job_id].nil?
                  query_option = option.dup
                  query_option.delete(:location)
-
-                 bq.query(@task[:sql], **query_option) do |job_updater|
-                   job_updater.location = option[:location] if option[:location]
+                 if @task[:large_results]
+                   dataset_id, table_id = @task[:result_table].split('.')
+                   dataset = bq.dataset dataset_id
+                   if dataset.nil?
+                     raise "not found dataset #{dataset_id}."
+                   end
+                   result_table = dataset.table table_id
+                   if result_table.nil?
+                     result_table = dataset.create_table table_id
+                   end
+                   job = bq.query_job(@task[:sql], table: result_table, write: 'truncate', large_results: true) do |job_updater|
+                     job_updater.location = option[:location] if option[:location]
+                   end
+                   job.wait_until_done!
+                   job.query_results(max: option[:max])
+                 else
+                   bq.query(@task[:sql], **query_option) do |job_updater|
+                     job_updater.location = option[:location] if option[:location]
+                   end
                  end
                else
                  job_option = {}
                  job_option[:location] = option[:location] if option[:location]
-
-                 bq.job(@task[:job_id], **job_option).query_results(max: option[:max])
+                 job = bq.job(@task[:job_id], **job_option)
+                 job.wait_until_done!
+                 job.query_results(max: option[:max])
                end
 
         @task[:columns] = values_to_sym(@task[:columns], 'name')
